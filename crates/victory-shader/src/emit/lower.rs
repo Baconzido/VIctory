@@ -3745,9 +3745,13 @@ impl<'a> Lower<'a> {
                         // VOP3P picks each half with op_sel/op_sel_hi; VOP2
                         // takes the low half for the low product.
                         let h = if packed {
-                            self.packed_src(inst, k, high)?
+                            self.packed_src(inst, k, high, true)?
                         } else {
-                            let x = s(self, k)?;
+                            let op = v.src.get(k).ok_or("a missing operand")?;
+                            let x = match self.src0 {
+                                Some(x) if k == 0 => x,
+                                _ => self.f16_operand(inst, op)?,
+                            };
                             let x = if high {
                                 let k16 = self.s.m.i32(16);
                                 self.s.m.bin(c, Bin::LShr, x, k16)
@@ -6637,8 +6641,8 @@ mod tests {
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
-    /// Lowers a compute program of constants: whether it translates.
-    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+    /// Lowers a compute program of constants.
+    fn lower_compute(words: &[u32]) -> Result<Vec<u8>, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -6667,7 +6671,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+        .map(|lowered| lowered.dxil)
     }
 
     #[test]
@@ -6698,7 +6702,39 @@ mod tests {
             S_ENDPGM,
         ];
         for words in [add, sub] {
-            lowers(&words).unwrap();
+            lower_compute(&words).unwrap();
+        }
+    }
+
+    #[test]
+    fn dot2_inline_f16_operands_match_packed_register_bits() {
+        // Put f16 (1, 3) into v1, f32 0.5 into v2, and f16 (2, 0) into v4.
+        let input = [
+            0x7E02_02FF,
+            0x4200_3C00,
+            0x7E04_02F0,
+            0x7E08_02FF,
+            0x0000_4000,
+        ];
+        let translate = |body: &[u32]| {
+            let mut words = input.to_vec();
+            words.extend_from_slice(body);
+            words.push(S_ENDPGM);
+            lower_compute(&words).unwrap()
+        };
+        let controls: &[(&[u32], &[u32])] = &[
+            // v_dot2_f32_f16 v0, 2.0/v4, v1, v2
+            (&[0xCC13_4000, 0x1C0A_02F4], &[0xCC13_4000, 0x1C0A_0304]),
+            // Swap both half selections for source zero.
+            (&[0xCC13_4800, 0x140A_02F4], &[0xCC13_4800, 0x140A_0304]),
+            // v_dot2c_f32_f16 v2, 2.0/v4, v1
+            (&[0x0404_02F4], &[0x0404_0304]),
+        ];
+        for (index, (inline, register)) in controls.iter().enumerate() {
+            assert!(
+                translate(inline) == translate(register),
+                "dot2 case {index}"
+            );
         }
     }
 

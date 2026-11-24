@@ -123,9 +123,10 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
@@ -159,6 +160,13 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     shader
 }
 
+/// One GPU test at a time. With these tests on the hardware adapter and WARP
+/// from several test threads at once, now and then none of their dispatches
+/// ever completes and the test binary hangs; and two GPU tests at once on
+/// WARP can end the test process with an access violation. Other GPU test
+/// modules take this lock too.
+pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 fn run_cases(
@@ -166,6 +174,7 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -300,6 +309,32 @@ fn v_med3_f32_matches_rdna2_with_nan() {
     });
 }
 
+/// RDNA2 orders -0 below +0 in its maximums and minimums; DXIL's FMax and
+/// FMin compare and select, which can give either zero.
+#[test]
+fn max_and_min_order_negative_zero_below_positive_zero() {
+    let (pz, nz) = (0_u32, 0x8000_0000_u32);
+    // Each case has a -0 and a +0 among its first two operands.
+    let cases = [
+        [nz, pz, nz, 0],
+        [pz, nz, nz, 0],
+        [nz, pz, pz, 0],
+        [pz, nz, pz, 0],
+    ];
+    let ops = [
+        ("v_max_f32", 0x110, pz),
+        ("v_min_f32", 0x10F, nz),
+        ("v_max3_f32", 0x154, pz),
+        ("v_min3_f32", 0x151, nz),
+    ];
+    for (name, op, want) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+        });
+    }
+}
+
 #[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)
@@ -339,6 +374,58 @@ fn v_med3_f16_matches_rdna2_with_nan() {
             ),
         }
     });
+}
+
+/// `v_cmp_lg_*` is "less or greater": ordered and not equal, so false when
+/// either operand is a NaN (RDNA2 ISA; the same on gfx1036 hardware).
+#[test]
+fn v_cmp_lg_is_false_for_nan() {
+    // v_cmp_lg_{f32,f16}_e64 s20, v1, v2 (VOPC 0x005 / 0x0cd in VOP3);
+    // v_cndmask_b32_e64 v0, 0, 1, s20 (VOP3 0x101)
+    let nan = f32::NAN.to_bits();
+    let (inf, ninf) = (f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits());
+    let f = f32::to_bits;
+    let f32_cases: &[([u32; 4], u32)] = &[
+        ([f(1.0), f(2.0), 0, 0], 1),
+        ([f(2.0), f(1.0), 0, 0], 1),
+        ([f(1.0), f(1.0), 0, 0], 0),
+        ([f(0.0), f(-0.0), 0, 0], 0),
+        ([inf, ninf, 0, 0], 1),
+        ([inf, inf, 0, 0], 0),
+        ([nan, f(1.0), 0, 0], 0),
+        ([f(1.0), nan, 0, 0], 0),
+        ([nan, nan, 0, 0], 0),
+        ([0x7F80_0001, f(0.0), 0, 0], 0), // a signalling NaN
+    ];
+    let f16_cases: &[([u32; 4], u32)] = &[
+        ([0x3C00, 0x4000, 0, 0], 1),
+        ([0x4000, 0x3C00, 0, 0], 1),
+        ([0x3C00, 0x3C00, 0, 0], 0),
+        ([0x0000, 0x8000, 0, 0], 0),
+        ([0x7C00, 0xFC00, 0, 0], 1),
+        ([0x7E00, 0x3C00, 0, 0], 0),
+        ([0x3C00, 0x7E00, 0, 0], 0),
+        ([0x7E00, 0x7E00, 0, 0], 0),
+        ([0x7C01, 0x0000, 0, 0], 0),           // a signalling NaN
+        ([0xABCD_3C00, 0x1234_7E00, 0, 0], 0), // only the low halves are read
+    ];
+    for (op, what, cases) in [
+        (0x005u16, "v_cmp_lg_f32", f32_cases),
+        (0x0cd, "v_cmp_lg_f16", f16_cases),
+    ] {
+        let mut body = vop3(op, 20, vgpr(1), vgpr(2), 0x80).to_vec();
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        let shader = build_valu_cs(&body);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: {what}({:#010x}, {:#010x}) = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
+    }
 }
 
 #[test]
@@ -439,6 +526,52 @@ fn v_fract_f16_never_returns_one() {
             ),
         }
     });
+}
+
+/// RDNA2's flt16_to_snorm16 / flt16_to_unorm16: clamp, scale by 32767 or
+/// 65535, round the exact product to nearest even; NaN gives 0.
+fn cvt_norm16_reference(bits: u16, signed: bool) -> u16 {
+    let x = f16_to_f32(bits);
+    if x.is_nan() {
+        return 0;
+    }
+    let (lo, scale) = if signed {
+        (-1.0, 32767.0)
+    } else {
+        (0.0, 65535.0)
+    };
+    // f64 holds the product of an f16 and a 16-bit scale exactly.
+    let p = f64::from(x.clamp(lo, 1.0)) * scale;
+    p.round_ties_even() as i32 as u16
+}
+
+#[test]
+fn v_cvt_norm_i16_and_u16_f16_round_the_exact_product() {
+    // Every 251st f16 pattern, plus the values where an f32 product would
+    // round before the rounding to an integer, ties, and the edges.
+    let mut bits: Vec<u16> = (0..=u16::MAX).step_by(251).collect();
+    bits.extend([
+        0x0000, 0x8000, 0x0001, 0x8001, 0x03FF, 0x0400, 0x3800, 0xB800, 0x3801, 0xB801, 0x37FF,
+        0x3BFF, 0xBBFF, 0x3C00, 0xBC00, 0x3C01, 0x7BFF, 0x7C00, 0xFC00, 0x7E00, 0xFE00, 0x7C01,
+        0x3A9B, 0xBA9B, 0x2E66, 0x1400,
+    ]);
+    for (op, signed, what) in [
+        (0x063u16, true, "v_cvt_norm_i16_f16"),
+        (0x064, false, "v_cvt_norm_u16_f16"),
+    ] {
+        // v_cvt_norm_*16_f16 v0, v1 (VOP1); v0's high half starts at 0.
+        let shader = build_valu_cs(&[vop1(0x001, 0, 128), vop1(op, 0, vgpr(1))]);
+        let inputs: Vec<[u32; 4]> = bits.iter().map(|&b| [u32::from(b), 0, 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let want = cvt_norm16_reference(bits[i], signed);
+            assert_eq!(
+                got,
+                u32::from(want),
+                "{backend}: {what}({:#06x}) = {got:#010x}, want {want:#06x}",
+                bits[i],
+            );
+        });
+    }
 }
 
 #[test]
@@ -542,6 +675,46 @@ fn v_sin_and_v_cos_f32_reduce_large_turns() {
 }
 
 #[test]
+fn v_cvt_u16_and_i16_f16_saturate() {
+    // v_mov_b32 v0, 0; v_cvt_u16_f16 / v_cvt_i16_f16 v0, v1 (VOP1 0x052 / 0x053).
+    let cases: &[(u16, u16, u16)] = &[
+        // (f16 input, u16 result, i16 result)
+        (0x0000, 0, 0),          // 0
+        (0x8000, 0, 0),          // -0
+        (0x3E00, 1, 1),          // 1.5 -> 1 (toward zero)
+        (0xBE00, 0, 0xFFFF),     // -1.5 -> 0 / -1
+        (0x57D0, 125, 125),      // 125.0
+        (0x7800, 32768, 32767),  // 32768 saturates i16
+        (0x77FF, 32752, 32752),  // 32752, the largest f16 below 32768
+        (0xF800, 0, 0x8000),     // -32768 fits i16
+        (0xF801, 0, 0x8000),     // -32800 saturates i16
+        (0x7BFF, 65504, 32767),  // max finite f16
+        (0xFBFF, 0, 0x8000),     // -65504
+        (0x7C00, 0xFFFF, 32767), // +inf
+        (0xFC00, 0, 0x8000),     // -inf
+        (0x7E00, 0, 0),          // NaN
+        (0xFE00, 0, 0),          // -NaN
+        (0x0001, 0, 0),          // smallest subnormal
+    ];
+    for (op, what, pick) in [
+        (0x052u16, "v_cvt_u16_f16", 0usize),
+        (0x053, "v_cvt_i16_f16", 1),
+    ] {
+        let shader = build_valu_cs(&[vop1(0x001, 0, 128), vop1(op, 0, vgpr(1))]);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [u32::from(c.0), 0, 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let want = if pick == 0 { cases[i].1 } else { cases[i].2 };
+            assert_eq!(
+                got,
+                u32::from(want),
+                "{backend}: {what}({:#06x}) = {got:#010x}, want {want:#06x}",
+                cases[i].0,
+            );
+        });
+    }
+}
+
+#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
@@ -619,6 +792,149 @@ fn v_sin_and_v_cos_f16_reduce_large_turns() {
                 inp[0],
             ),
         }
+    });
+}
+
+#[test]
+fn bfe_signed_and_unsigned_match_rdna2() {
+    // v_bfe_i32 v0, v1, v2, v3 (VOP3 opcode 0x149)
+    let v_signed = build_valu_cs(&vop3(0x149, 0, vgpr(1), vgpr(2), vgpr(3)));
+    // v_bfe_u32 v0, v1, v2, v3 (VOP3 opcode 0x148)
+    let v_unsigned = build_valu_cs(&vop3(0x148, 0, vgpr(1), vgpr(2), vgpr(3)));
+    // s_bfe_i32 s6, s0, s1 (SOP2 opcode 0x28: s1 = off[4:0] | width[22:16]); v_mov_b32 v0, s6
+    let s_signed = build_valu_cs(&[sop2(0x28, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+
+    let signed_cases: &[([u32; 4], u32)] = &[
+        // Field crosses bit 31: extends from bit 31.
+        ([0xd2f9_0159, 28, 16, 0], 0xffff_fffd),
+        ([0x8000_0000, 31, 4, 0], 0xffff_ffff),
+        ([0x7000_0000, 28, 8, 0], 0x0000_0007),
+        // Normal fields inside 32 bits.
+        ([0x0000_0080, 4, 4, 0], 0xffff_fff8),
+        ([0x0000_0070, 4, 4, 0], 0x0000_0007),
+        // Edge widths: 0 yields 0; v_bfe masks width to 5 bits (32 -> 0),
+        // while 31 extracts all remaining bits from offset 4.
+        ([0xffff_ffff, 4, 0, 0], 0),
+        ([0x8000_0000, 4, 31, 0], 0xf800_0000),
+    ];
+    let v_in: Vec<[u32; 4]> = signed_cases.iter().map(|c| c.0).collect();
+    run_cases(&v_signed, &v_in, |backend, i, inp, got| {
+        let want = signed_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_bfe_i32({:#010x}, {}, {}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+    // v_bfe_i32 width is 5-bit (src2[4:0]), so width=32 wraps to 0.
+    run_cases(
+        &v_signed,
+        &[[0x8000_0000, 4, 32, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, 0, "{backend}: v_bfe_i32 width 32 should mask to 0");
+        },
+    );
+
+    // s_bfe_i32 width is 7-bit (src1[22:16]), so width=32 keeps all 32 bits.
+    let mut s_cases = signed_cases.to_vec();
+    s_cases.push(([0x8000_0000, 4, 32, 0], 0xf800_0000));
+    let s_in: Vec<[u32; 4]> = s_cases
+        .iter()
+        .map(|&(inp, _)| [inp[0], (inp[1] & 31) | ((inp[2] & 0x7F) << 16), 0, 0])
+        .collect();
+    run_cases(&s_signed, &s_in, |backend, i, inp, got| {
+        let want = s_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: s_bfe_i32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+
+    let unsigned_cases: &[([u32; 4], u32)] = &[
+        ([0xd2f9_0159, 28, 16, 0], 0x0000_000d),
+        ([0x8000_0000, 31, 4, 0], 0x0000_0001),
+        ([0xffff_ffff, 4, 0, 0], 0),
+        ([0x8000_0000, 4, 31, 0], 0x0800_0000),
+    ];
+    let u_in: Vec<[u32; 4]> = unsigned_cases.iter().map(|c| c.0).collect();
+    run_cases(&v_unsigned, &u_in, |backend, i, inp, got| {
+        let want = unsigned_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_bfe_u32({:#010x}, {}, {}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}
+
+#[test]
+fn v_cmp_class_f16_matches_rdna2() {
+    // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
+    let cmp_lo = build_valu_cs(&[
+        vop3(0x08f, 6, vgpr(1), vgpr(2), 0)[0],
+        vop3(0x08f, 6, vgpr(1), vgpr(2), 0)[1],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+    // Same with op_sel:[1,0] (high half of v1) + neg on src0 (bit 29 of w1).
+    let [mut w0, mut w1] = vop3(0x08f, 6, vgpr(1), vgpr(2), 0);
+    w0 |= 1 << 11; // opsel[0] = 1 (high half)
+    w1 |= 1 << 29; // neg[0] = 1
+    let cmp_hi_neg = build_valu_cs(&[
+        w0,
+        w1,
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+
+    // All 10 IEEE-754 binary16 classes: bit k corresponds to class k.
+    let classes: &[(u32, u32)] = &[
+        (0x7C01, 0), // sNaN (+sNaN, quiet bit 0x0200 clear)
+        (0xFDFF, 0), // -sNaN (sign ignored for NaNs)
+        (0x7E00, 1), // +qNaN
+        (0xFE01, 1), // -qNaN
+        (0xFC00, 2), // -inf
+        (0xBC00, 3), // -normal (-1.0)
+        (0x8001, 4), // -denormal
+        (0x8000, 5), // -0.0
+        (0x0000, 6), // +0.0
+        (0x0001, 7), // +denormal
+        (0x3C00, 8), // +normal (+1.0)
+        (0x7C00, 9), // +inf
+    ];
+    let mut cases = Vec::new();
+    for &(bits, cls) in classes {
+        // Exact class bit -> true; complement of class bit across all 10 bits -> false.
+        cases.push(([bits, 1u32 << cls, 0, 0], 1u32));
+        cases.push(([bits, 0x3FF & !(1u32 << cls), 0, 0], 0u32));
+    }
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_lo, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f16({:#06x}, {:#05x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+
+    // High half with neg: high half 0x3C00 (+1.0) negated -> -normal (class 3);
+    // high half 0x7C01 (+sNaN) negated -> still sNaN (class 0, not quieted).
+    let hi_cases: &[([u32; 4], u32)] = &[
+        ([0x3C00_0000, 1 << 3, 0, 0], 1),
+        ([0x3C00_0000, 1 << 8, 0, 0], 0),
+        ([0x7C01_FFFF, 1 << 0, 0, 0], 1),
+        ([0x7C01_FFFF, 1 << 1, 0, 0], 0),
+    ];
+    let hi_in: Vec<[u32; 4]> = hi_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_hi_neg, &hi_in, |backend, i, inp, got| {
+        let want = hi_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f16(-hi({:#010x}), {:#05x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
     });
 }
 
@@ -742,6 +1058,20 @@ fn v_dot2_f32_f16_clamps_to_zero_one() {
 }
 
 #[test]
+fn dot2_inline_f16_multiplicands_use_only_the_low_half() {
+    let inputs = [[0xC400_4000, 0x3F80_0000, 0, 0]]; // f16 (2, -4), f32 1
+    let dot = vop3p_mods(0x13, 0, [240, vgpr(1), vgpr(2)], 0, 0b111, 0, 0, false);
+    let swapped = vop3p_mods(0x13, 0, [240, vgpr(1), vgpr(2)], 1, 0b110, 0, 0, false);
+    let accumulate = [vop2(0x02, 2, 240, 1), vop1(0x001, 0, vgpr(2))];
+    for (words, expected) in [(dot, 2.0f32), (swapped, -1.0), (accumulate, 2.0)] {
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &inputs, |backend, _, _, result| {
+            assert_eq!(result, expected.to_bits(), "{backend} dot2 inline f16");
+        });
+    }
+}
+
+#[test]
 fn v_dot2c_f32_f16_accumulates_into_its_destination() {
     // v3 = v_dot2c_f32_f16 v1, v2 (v3 += v1 . v2), then v0 = v3.
     let body = [vop2(0x02, 3, vgpr(1), 2), vop1(0x001, 0, vgpr(3))];
@@ -757,88 +1087,45 @@ fn v_dot2c_f32_f16_accumulates_into_its_destination() {
     });
 }
 
-#[test]
-fn dot2_inline_f16_multiplicands_use_only_the_low_half() {
-    let inputs = [[0xC400_4000, 0x3F80_0000, 0, 0]]; // f16 (2, -4), f32 1
-    let dot = vop3p_mods(0x13, 0, [240, vgpr(1), vgpr(2)], 0, 0b111, 0, 0, false);
-    let swapped = vop3p_mods(0x13, 0, [240, vgpr(1), vgpr(2)], 1, 0b110, 0, 0, false);
-    let accumulate = [vop2(0x02, 2, 240, 1), vop1(0x001, 0, vgpr(2))];
-    for (words, expected) in [(dot, 2.0f32), (swapped, -1.0), (accumulate, 2.0)] {
-        let shader = build_valu_cs(&words);
-        run_cases(&shader, &inputs, |backend, _, _, result| {
-            assert_eq!(result, expected.to_bits(), "{backend} dot2 inline f16");
-        });
-    }
-}
+/// Inputs where rounding the sum of the two products before adding the
+/// addend gives a different f32 than RDNA2, which rounds the exact
+/// `p0 + p1 + addend` once (measured on gfx1036 in #465).
+const DOT2_ROUNDED_ONCE_CASES: &[([u32; 4], u32)] = &[
+    // (1, 2^-12) . (1, 2^-12) - 1 = 2^-24; 1 + 2^-24 rounded first gives 0.
+    ([0x0c00_3c00, 0x0c00_3c00, 0xbf80_0000, 0], 0x3380_0000),
+    // (1, 2^-14) . (1, 2^-14) + 2^24 = 2^24 + 1 + 2^-28: above the tie
+    // between 2^24 and 2^24 + 2, so it rounds up; 1 + 2^-28 rounded first
+    // lands on the tie, which rounds to even (2^24).
+    ([0x0400_3c00, 0x0400_3c00, 0x4b80_0000, 0], 0x4b80_0001),
+    // (-0, -0) . (1, 1) - 0 = -0: the sign of an all-negative-zero sum.
+    ([0x8000_8000, 0x3c00_3c00, 0x8000_0000, 0], 0x8000_0000),
+];
 
 #[test]
-fn bfe_signed_and_unsigned_match_rdna2() {
-    // v_bfe_i32 v0, v1, v2, v3 (VOP3 opcode 0x149)
-    let v_signed = build_valu_cs(&vop3(0x149, 0, vgpr(1), vgpr(2), vgpr(3)));
-    // v_bfe_u32 v0, v1, v2, v3 (VOP3 opcode 0x148)
-    let v_unsigned = build_valu_cs(&vop3(0x148, 0, vgpr(1), vgpr(2), vgpr(3)));
-    // s_bfe_i32 s6, s0, s1 (SOP2 opcode 0x28: s1 = off[4:0] | width[22:16]); v_mov_b32 v0, s6
-    let s_signed = build_valu_cs(&[sop2(0x28, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
-
-    let signed_cases: &[([u32; 4], u32)] = &[
-        // Field crosses bit 31: extends from bit 31.
-        ([0xd2f9_0159, 28, 16, 0], 0xffff_fffd),
-        ([0x8000_0000, 31, 4, 0], 0xffff_ffff),
-        ([0x7000_0000, 28, 8, 0], 0x0000_0007),
-        // Normal fields inside 32 bits.
-        ([0x0000_0080, 4, 4, 0], 0xffff_fff8),
-        ([0x0000_0070, 4, 4, 0], 0x0000_0007),
-        // Edge widths: 0 yields 0; v_bfe masks width to 5 bits (32 -> 0),
-        // while 31 extracts all remaining bits from offset 4.
-        ([0xffff_ffff, 4, 0, 0], 0),
-        ([0x8000_0000, 4, 31, 0], 0xf800_0000),
-    ];
-    let v_in: Vec<[u32; 4]> = signed_cases.iter().map(|c| c.0).collect();
-    run_cases(&v_signed, &v_in, |backend, i, inp, got| {
-        let want = signed_cases[i].1;
+fn v_dot2_f32_f16_rounds_the_exact_sum_once() {
+    let body = vop3p_mods(0x13, 0, [vgpr(1), vgpr(2), vgpr(3)], 0, 0b111, 0, 0, false);
+    let shader = build_valu_cs(&body);
+    let inputs: Vec<[u32; 4]> = DOT2_ROUNDED_ONCE_CASES.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = DOT2_ROUNDED_ONCE_CASES[i].1;
         assert_eq!(
             got, want,
-            "{backend}: v_bfe_i32({:#010x}, {}, {}) = {got:#010x}, want {want:#010x}",
+            "{backend}: v_dot2_f32_f16({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
             inp[0], inp[1], inp[2],
         );
     });
-    // v_bfe_i32 width is 5-bit (src2[4:0]), so width=32 wraps to 0.
-    run_cases(
-        &v_signed,
-        &[[0x8000_0000, 4, 32, 0]],
-        |backend, _, _, got| {
-            assert_eq!(got, 0, "{backend}: v_bfe_i32 width 32 should mask to 0");
-        },
-    );
+}
 
-    // s_bfe_i32 width is 7-bit (src1[22:16]), so width=32 keeps all 32 bits.
-    let mut s_cases = signed_cases.to_vec();
-    s_cases.push(([0x8000_0000, 4, 32, 0], 0xf800_0000));
-    let s_in: Vec<[u32; 4]> = s_cases
-        .iter()
-        .map(|&(inp, _)| [inp[0], (inp[1] & 31) | ((inp[2] & 0x7F) << 16), 0, 0])
-        .collect();
-    run_cases(&s_signed, &s_in, |backend, i, inp, got| {
-        let want = s_cases[i].1;
+#[test]
+fn v_dot2c_f32_f16_rounds_the_exact_sum_once() {
+    let body = [vop2(0x02, 3, vgpr(1), 2), vop1(0x001, 0, vgpr(3))];
+    let shader = build_valu_cs(&body);
+    let inputs: Vec<[u32; 4]> = DOT2_ROUNDED_ONCE_CASES.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = DOT2_ROUNDED_ONCE_CASES[i].1;
         assert_eq!(
             got, want,
-            "{backend}: s_bfe_i32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
-            inp[0], inp[1],
-        );
-    });
-
-    let unsigned_cases: &[([u32; 4], u32)] = &[
-        ([0xd2f9_0159, 28, 16, 0], 0x0000_000d),
-        ([0x8000_0000, 31, 4, 0], 0x0000_0001),
-        ([0xffff_ffff, 4, 0, 0], 0),
-        ([0x8000_0000, 4, 31, 0], 0x0800_0000),
-    ];
-    let u_in: Vec<[u32; 4]> = unsigned_cases.iter().map(|c| c.0).collect();
-    run_cases(&v_unsigned, &u_in, |backend, i, inp, got| {
-        let want = unsigned_cases[i].1;
-        assert_eq!(
-            got, want,
-            "{backend}: v_bfe_u32({:#010x}, {}, {}) = {got:#010x}, want {want:#010x}",
+            "{backend}: v_dot2c_f32_f16({:#010x}, {:#010x}) + {:#010x} = {got:#010x}, want {want:#010x}",
             inp[0], inp[1], inp[2],
         );
     });

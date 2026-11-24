@@ -1588,3 +1588,47 @@ fn v_dot2c_f32_f16_accumulates_into_its_destination() {
         );
     });
 }
+
+/// Inputs where rounding the sum of the two products before adding the
+/// addend gives a different f32 than RDNA2, which rounds the exact
+/// `p0 + p1 + addend` once (measured on gfx1036 in #465).
+const DOT2_ROUNDED_ONCE_CASES: &[([u32; 4], u32)] = &[
+    // (1, 2^-12) . (1, 2^-12) - 1 = 2^-24; 1 + 2^-24 rounded first gives 0.
+    ([0x0c00_3c00, 0x0c00_3c00, 0xbf80_0000, 0], 0x3380_0000),
+    // (1, 2^-14) . (1, 2^-14) + 2^24 = 2^24 + 1 + 2^-28: above the tie
+    // between 2^24 and 2^24 + 2, so it rounds up; 1 + 2^-28 rounded first
+    // lands on the tie, which rounds to even (2^24).
+    ([0x0400_3c00, 0x0400_3c00, 0x4b80_0000, 0], 0x4b80_0001),
+    // (-0, -0) . (1, 1) - 0 = -0: the sign of an all-negative-zero sum.
+    ([0x8000_8000, 0x3c00_3c00, 0x8000_0000, 0], 0x8000_0000),
+];
+
+#[test]
+fn v_dot2_f32_f16_rounds_the_exact_sum_once() {
+    let body = vop3p_mods(0x13, 0, [vgpr(1), vgpr(2), vgpr(3)], 0, 0b111, 0, 0, false);
+    let shader = build_valu_cs(&body);
+    let inputs: Vec<[u32; 4]> = DOT2_ROUNDED_ONCE_CASES.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = DOT2_ROUNDED_ONCE_CASES[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_dot2_f32_f16({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}
+
+#[test]
+fn v_dot2c_f32_f16_rounds_the_exact_sum_once() {
+    let body = [vop2(0x02, 3, vgpr(1), 2), vop1(0x001, 0, vgpr(3))];
+    let shader = build_valu_cs(&body);
+    let inputs: Vec<[u32; 4]> = DOT2_ROUNDED_ONCE_CASES.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = DOT2_ROUNDED_ONCE_CASES[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_dot2c_f32_f16({:#010x}, {:#010x}) + {:#010x} = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}

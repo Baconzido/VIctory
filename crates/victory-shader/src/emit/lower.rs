@@ -1411,6 +1411,65 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Knuth's TwoSum: `(s, e)` with `s` the f32 sum of `a` and `b` and
+    /// `e` its rounding error, so `s + e == a + b` exactly (finite inputs).
+    fn two_sum(&mut self, a: V, b: V) -> (V, V) {
+        let c = self.cur;
+        let s = self.s.m.bin(c, Bin::Add, a, b);
+        let bb = self.s.m.bin(c, Bin::Sub, s, a);
+        let aa = self.s.m.bin(c, Bin::Sub, s, bb);
+        let da = self.s.m.bin(c, Bin::Sub, a, aa);
+        let db = self.s.m.bin(c, Bin::Sub, b, bb);
+        let e = self.s.m.bin(c, Bin::Add, da, db);
+        (s, e)
+    }
+
+    /// `a + b + d` rounded to f32 once, as a fused sum: Boldo and
+    /// Melquiond's correctly rounded sum of three ("Emulation of FMA and
+    /// correctly rounded sums: proved algorithms using rounding to odd",
+    /// IEEE TC 2008). The two TwoSum errors are added with rounding to
+    /// odd, so the last addition rounds as the exact sum would. An
+    /// infinite or NaN term gives the plain sum.
+    /// shortcut: an f32 denormal along the way follows the shader's
+    /// denormal mode.
+    fn sum3_rounded_once(&mut self, a: V, b: V, d: V) -> V {
+        let c = self.cur;
+        let (uh, ul) = self.two_sum(b, d);
+        let (th, tl) = self.two_sum(a, uh);
+        // v = tl + ul rounded to odd: where the sum is inexact and its last
+        // bit is even, one step toward the exact value (the error's side).
+        let (v, e) = self.two_sum(tl, ul);
+        let (vi, ei) = (self.as_int(v), self.as_int(e));
+        let one = self.s.m.i32(1);
+        let lsb = self.s.m.bin(c, Bin::And, vi, one);
+        let zero = self.s.m.i32(0);
+        let even = self.s.m.cmp(c, pred::EQ, lsb, zero);
+        let fzero = self.s.m.f32(0);
+        let inexact = self.s.m.cmp(c, pred::UNE, e, fzero);
+        let bump = self.s.m.bin(c, Bin::And, even, inexact);
+        // Same sign: away from zero (+1 on the magnitude bits), else toward.
+        let signs = self.s.m.bin(c, Bin::Xor, vi, ei);
+        let apart = self.s.m.cmp(c, pred::SLT, signs, zero);
+        let minus_one = self.s.m.i32(u32::MAX);
+        let step = self.s.m.select(c, apart, minus_one, one);
+        let odd = self.s.m.bin(c, Bin::Add, vi, step);
+        let odd = self.as_float(odd);
+        let v = self.s.m.select(c, bump, odd, v);
+        // A zero tail leaves th as it is, -0 included (th + +0 would be +0).
+        let z = self.s.m.bin(c, Bin::Add, th, v);
+        let tail = self.s.m.cmp(c, pred::OEQ, v, fzero);
+        let z = self.s.m.select(c, tail, th, z);
+        // Where th is infinite or NaN the TwoSum errors are NaN, and th is
+        // the sum (for a dot product of halves, whose products stay below
+        // 2^32, that takes an infinite or NaN term).
+        let ti = self.as_int(th);
+        let abs = self.s.m.i32(0x7FFF_FFFF);
+        let mag = self.s.m.bin(c, Bin::And, ti, abs);
+        let inf = self.s.m.i32(0x7F80_0000);
+        let finite = self.s.m.cmp(c, pred::IULT, mag, inf);
+        self.s.m.select(c, finite, z, th)
+    }
+
     /// `f` as an f16 in the low bits, rounded toward zero: the nearest-even
     /// conversion, one step back toward zero where it rounded away (which
     /// also turns an overflow to infinity into the largest finite half).
@@ -3951,9 +4010,9 @@ impl<'a> Lower<'a> {
             "v_dot2_f32_f16" | "v_dot2c_f32_f16" => {
                 // D.f32 = S0.f16[0] * S1.f16[0] + S0.f16[1] * S1.f16[1] + S2.f32;
                 // v_dot2c (VOP2) accumulates into its destination instead of
-                // S2. Each f16 and each of their products is exact in f32.
-                // shortcut: the two products and the addend are summed with
-                // two f32 roundings, where the hardware may round once.
+                // S2. Each f16 and each of their products is exact in f32,
+                // and RDNA2 rounds the exact sum of the products and the
+                // addend once (measured on gfx1036).
                 let packed = name == "v_dot2_f32_f16";
                 if v.omod != 0
                     || v.sdwa.is_some()
@@ -4010,8 +4069,7 @@ impl<'a> Lower<'a> {
                         }
                     }
                 };
-                let sum = self.s.m.bin(c, Bin::Add, products[0], products[1]);
-                let mut r = self.s.m.bin(c, Bin::Add, sum, acc);
+                let mut r = self.sum3_rounded_once(products[0], products[1], acc);
                 if v.clamp {
                     r = self.unary(7, r);
                 }

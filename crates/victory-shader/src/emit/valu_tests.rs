@@ -2402,6 +2402,19 @@ fn v_dot2_f32_f16_clamps_to_zero_one() {
 }
 
 #[test]
+fn dot2_inline_f16_multiplicands_use_only_the_low_half() {
+    let inputs = [[0xC400_4000, 0x3F80_0000, 0, 0]]; // f16 (2, -4), f32 1
+    let dot = vop3p_mods(0x13, 0, [240, vgpr(1), vgpr(2)], 0, 0b111, 0, 0, false);
+    let swapped = vop3p_mods(0x13, 0, [240, vgpr(1), vgpr(2)], 1, 0b110, 0, 0, false);
+    for (words, expected) in [(dot, 2.0f32), (swapped, -1.0)] {
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &inputs, |backend, _, _, result| {
+            assert_eq!(result, expected.to_bits(), "{backend} dot2 inline f16");
+        });
+    }
+}
+
+#[test]
 fn v_dot2c_f32_f16_accumulates_into_its_destination() {
     // v3 = v_dot2c_f32_f16 v1, v2 (v3 += v1 . v2), then v0 = v3.
     let body = [vop2(0x02, 3, vgpr(1), 2), vop1(0x001, 0, vgpr(3))];

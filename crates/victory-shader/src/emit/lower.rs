@@ -10957,6 +10957,10 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lower_compute(words, rsrc2).map(|_| ())
+    }
+
+    fn lower_compute(words: &[u32], rsrc2: u32) -> Result<Vec<u8>, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -10986,7 +10990,7 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
         })
-        .map(|_| ())
+        .map(|lowered| lowered.dxil)
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
@@ -11197,6 +11201,36 @@ mod tests {
             S_ENDPGM,
         ];
         lowers(&words, 0x8001).unwrap();
+    }
+
+    #[test]
+    fn dot2_inline_f16_operands_match_packed_register_bits() {
+        // Put f16 (1, 3) into v1, f32 0.5 into v2, and f16 (2, 0) into v4.
+        let input = [
+            0x7E02_02FF,
+            0x4200_3C00,
+            0x7E04_02F0,
+            0x7E08_02FF,
+            0x0000_4000,
+        ];
+        let translate = |body: &[u32]| {
+            let mut words = input.to_vec();
+            words.extend_from_slice(body);
+            words.push(S_ENDPGM);
+            lower_compute(&words, 0).unwrap()
+        };
+        let controls: &[(&[u32], &[u32])] = &[
+            // v_dot2_f32_f16 v0, 2.0/v4, v1, v2
+            (&[0xCC13_4000, 0x1C0A_02F4], &[0xCC13_4000, 0x1C0A_0304]),
+            // Swap both half selections for source zero.
+            (&[0xCC13_4800, 0x140A_02F4], &[0xCC13_4800, 0x140A_0304]),
+        ];
+        for (index, (inline, register)) in controls.iter().enumerate() {
+            assert!(
+                translate(inline) == translate(register),
+                "dot2 case {index}"
+            );
+        }
     }
 
     fn perm_features(selector: u32) -> u64 {

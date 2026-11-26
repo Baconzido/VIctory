@@ -2417,6 +2417,27 @@ fn v_dot2c_f32_f16_accumulates_into_its_destination() {
     });
 }
 
+#[test]
+fn v_dot2c_f32_f16_refuses_inline_constants() {
+    // v3 = v_dot2c_f32_f16 1.0, v2 (242) and 1, v2 (129): how VOP2 widens an
+    // inline constant to a pair of halves is not measured.
+    for constant in [242, 129] {
+        let body = [vop2(0x02, 3, constant, 2), vop1(0x001, 0, vgpr(3))];
+        let refused = try_build_valu_cs(&body);
+        assert!(
+            matches!(
+                refused,
+                Err(crate::ShaderError::Unsupported {
+                    what: "an inline constant of v_dot2c_f32_f16",
+                    ..
+                })
+            ),
+            "source {constant}: {:?}",
+            refused.err()
+        );
+    }
+}
+
 /// Inputs where rounding the sum of the two products before adding the
 /// addend gives a different f32 than RDNA2, which rounds the exact
 /// `p0 + p1 + addend` once (measured on gfx1036 in #465).

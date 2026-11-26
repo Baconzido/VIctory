@@ -11224,8 +11224,6 @@ mod tests {
             (&[0xCC13_4000, 0x1C0A_02F4], &[0xCC13_4000, 0x1C0A_0304]),
             // Swap both half selections for source zero.
             (&[0xCC13_4800, 0x140A_02F4], &[0xCC13_4800, 0x140A_0304]),
-            // v_dot2c_f32_f16 v2, 2.0/v4, v1
-            (&[0x0404_02F4], &[0x0404_0304]),
         ];
         for (index, (inline, register)) in controls.iter().enumerate() {
             assert!(

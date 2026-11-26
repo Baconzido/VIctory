@@ -36,11 +36,12 @@ impl Lower<'_> {
                 let h = if packed {
                     self.packed_src(inst, k, high, true)?
                 } else {
-                    let op = v.src.get(k).ok_or("a missing operand")?;
-                    let x = match self.src0 {
-                        Some(x) if k == 0 => x,
-                        _ => self.f16_operand(inst, op)?,
-                    };
+                    if matches!(v.src.get(k), Some(Operand::Const(_))) {
+                        // shortcut: how VOP2 widens an inline constant to a
+                        // pair of halves is not measured.
+                        return Err("an inline constant of v_dot2c_f32_f16");
+                    }
+                    let x = self.src(inst, k)?;
                     let x = if high {
                         let k16 = self.s.m.i32(16);
                         self.s.m.bin(c, Bin::LShr, x, k16)
@@ -78,10 +79,8 @@ impl Lower<'_> {
                 }
             }
         };
-        let mut r = self.sum3_rounded_once(products[0], products[1], acc);
-        if v.clamp {
-            r = self.unary(7, r);
-        }
+        // write_f applies the clamp.
+        let r = self.sum3_rounded_once(products[0], products[1], acc);
         self.write_f(inst, r, guard)
     }
 
